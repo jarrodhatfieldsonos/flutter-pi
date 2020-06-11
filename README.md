@@ -1,5 +1,5 @@
 # To build ...
-./scripts/install_deps (only need to do this once)  
+./scripts/install_deps.sh (only need to do this once)  
 ./scripts/make_flutter.sh .
 
 # flutter-pi
