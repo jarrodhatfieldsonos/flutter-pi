@@ -5,4 +5,4 @@ sudo apt install git libgles2-mesa-dev libdrm-dev libgbm-dev gpiod libgpiod-dev 
 sudo apt install ttf-mscorefonts-installer fontconfig
 sudo fc-cache
 
-usermod -a -G render pi
+sudo usermod -a -G render pi
