@@ -21,14 +21,19 @@
 #include <time.h>
 #include <glob.h>
 
+//#define USE_OPENGL
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+#ifdef USE_OPENGL
 #include <gbm.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #include <flutter_embedder.h>
 
@@ -111,6 +116,8 @@ struct {
 	char device[PATH_MAX];
 	bool has_device;
 	int fd;
+	struct drm_fb* fbo;
+	void* fboMem;
 	uint32_t connector_id;
 	drmModeModeInfo *mode;
 	uint32_t crtc_id;
@@ -120,6 +127,7 @@ struct {
 	bool disable_vsync;
 } drm = {0};
 
+#ifdef USE_OPENGL
 struct {
 	struct gbm_device  *device;
 	struct gbm_surface *surface;
@@ -140,6 +148,7 @@ struct {
 	EGLSurface (*eglCreatePlatformWindowSurfaceEXT)(EGLDisplay dpy, EGLConfig config, void *native_window, const EGLint *attrib_list);
 	EGLSurface (*eglCreatePlatformPixmapSurfaceEXT)(EGLDisplay dpy, EGLConfig config, void *native_pixmap, const EGLint *attrib_list);
 } egl = {0};
+#endif // USE_OPENGL
 
 struct {
 	char asset_bundle_path[240];
@@ -181,10 +190,12 @@ FlutterEngine engine;
 _Atomic bool  engine_running = false;
 
 
+#ifdef USE_OPENGL
+
 /*********************
  * FLUTTER CALLBACKS *
  *********************/
-bool     	   make_current(void* userdata) {
+bool make_current(void* userdata) {
 	if (eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context) != EGL_TRUE) {
 		fprintf(stderr, "make_current: could not make the context current.\n");
 		return false;
@@ -192,7 +203,9 @@ bool     	   make_current(void* userdata) {
 	
 	return true;
 }
-bool     	   clear_current(void* userdata) {
+
+bool clear_current(void* userdata)
+{
 	if (eglMakeCurrent(egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) != EGL_TRUE) {
 		fprintf(stderr, "clear_current: could not clear the current context.\n");
 		return false;
@@ -200,7 +213,9 @@ bool     	   clear_current(void* userdata) {
 	
 	return true;
 }
-void		   pageflip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *userdata) {
+
+void pageflip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *userdata)
+{
 	FlutterEngineTraceEventInstant("pageflip");
 	post_platform_task(&(struct flutterpi_task) {
 		.type = kVBlankReply,
@@ -208,7 +223,9 @@ void		   pageflip_handler(int fd, unsigned int frame, unsigned int sec, unsigned
 		.vblank_ns = sec*1000000000ull + usec*1000ull,
 	});
 }
-void     	   drm_fb_destroy_callback(struct gbm_bo *bo, void *data) {
+
+void drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
+{
 	struct drm_fb *fb = data;
 
 	if (fb->fb_id)
@@ -216,7 +233,9 @@ void     	   drm_fb_destroy_callback(struct gbm_bo *bo, void *data) {
 	
 	free(fb);
 }
-struct drm_fb *drm_fb_get_from_bo(struct gbm_bo *bo) {
+
+struct drm_fb *drm_fb_get_from_bo(struct gbm_bo *bo)
+{
 	uint32_t width, height, format, strides[4] = {0}, handles[4] = {0}, offsets[4] = {0}, flags = 0;
 	int ok = -1;
 
@@ -271,7 +290,8 @@ struct drm_fb *drm_fb_get_from_bo(struct gbm_bo *bo) {
 
 	return fb;
 }
-bool     	   present(void* userdata) {
+
+bool present(void* userdata) {
 	fd_set fds;
 	struct gbm_bo *next_bo;
 	struct drm_fb *fb;
@@ -305,10 +325,14 @@ bool     	   present(void* userdata) {
 	
 	return true;
 }
-uint32_t 	   fbo_callback(void* userdata) {
+
+uint32_t fbo_callback(void* userdata)
+{
 	return 0;
 }
-void 	 	   cut_word_from_string(char* string, char* word) {
+
+void cut_word_from_string(char* string, char* word)
+{
 	size_t word_length = strlen(word);
 	char*  word_in_str = strstr(string, word);
 
@@ -325,7 +349,9 @@ void 	 	   cut_word_from_string(char* string, char* word) {
 		} while (word_in_str[i++ + word_length] != 0);
 	}
 }
-const GLubyte *hacked_glGetString(GLenum name) {
+
+const GLubyte *hacked_glGetString(GLenum name)
+{
 	static GLubyte *extensions = NULL;
 
 	if (name != GL_EXTENSIONS)
@@ -407,7 +433,9 @@ const GLubyte *hacked_glGetString(GLenum name) {
 
 	return extensions;
 }
-void          *proc_resolver(void* userdata, const char* name) {
+
+void *proc_resolver(void* userdata, const char* name)
+{
 	static int is_VC4 = -1;
 	void      *address;
 
@@ -436,19 +464,9 @@ void          *proc_resolver(void* userdata, const char* name) {
 
 	return NULL;
 }
-void     	   on_platform_message(const FlutterPlatformMessage* message, void* userdata) {
-	int ok;
-	if ((ok = plugin_registry_on_platform_message((FlutterPlatformMessage *)message)) != 0)
-		fprintf(stderr, "plugin_registry_on_platform_message failed: %s\n", strerror(ok));
-}
-void	 	   vsync_callback(void* userdata, intptr_t baton) {
-	post_platform_task(&(struct flutterpi_task) {
-		.type = kVBlankRequest,
-		.target_time = 0,
-		.baton = baton
-	});
-}
-FlutterTransformation transformation_callback(void *userdata) {
+
+FlutterTransformation transformation_callback(void *userdata)
+{
 	// report a transform based on the current device orientation.
 	static bool _transformsInitialized = false;
 	static FlutterTransformation rotate0, rotate90, rotate180, rotate270;
@@ -479,7 +497,137 @@ FlutterTransformation transformation_callback(void *userdata) {
 	else if (rotation == 270) return rotate270;
 	else return rotate0;
 }
+#else // ^USE_OPENGL^
 
+struct drm_fb* createDumbBuffer(uint32_t width,
+				                uint32_t height,
+								uint32_t bpp)
+{
+    int ret;
+
+    uint64_t cap = 0;
+    ret = drmGetCap(drm.fd, DRM_CAP_DUMB_BUFFER, &cap);
+    if (ret || cap == 0) {
+        fprintf(stderr, "driver doesn't support the dumb buffer API");
+        return NULL;
+    }
+
+    // Create a dumb buffer
+    struct drm_mode_create_dumb bo_create;
+    memset(&bo_create, 0, sizeof(bo_create));
+    bo_create.width  = width;
+    bo_create.height = height;
+    bo_create.bpp    = bpp;
+    ret = drmIoctl(drm.fd, DRM_IOCTL_MODE_CREATE_DUMB, &bo_create);
+
+    if (ret == 0) {
+
+        // Prepare buffer for memory mapping
+        struct drm_mode_map_dumb bo_map;
+        memset(&bo_map, 0, sizeof(bo_map));
+        bo_map.handle = bo_create.handle;
+        ret = drmIoctl(drm.fd, DRM_IOCTL_MODE_MAP_DUMB, &bo_map);
+
+        if (ret == 0) {
+            
+            // Perform actual memory mapping
+            void* mem = mmap(0, bo_create.size,
+                                PROT_READ | PROT_WRITE, MAP_SHARED,
+                                drm.fd, bo_map.offset);
+            if (mem != MAP_FAILED) {
+
+                // clear the buffer to GRAY
+                memset(mem, 0x80, bo_create.size);
+
+                // Create framebuffer
+                uint32_t handles[4] = { bo_create.handle, };
+                uint32_t pitches[4] = { bo_create.pitch, };
+                uint32_t offsets[4] = { 0, };
+                uint32_t fbId;
+                uint32_t fourcc = (bpp == 32) ? DRM_FORMAT_ARGB8888 :
+                                                DRM_FORMAT_RGB888;
+
+                // Add buffer to DRM - get back the framebuffer ID
+                ret = drmModeAddFB2(drm.fd, width, height, fourcc,
+                                    handles, pitches, offsets, &fbId, 0);
+                if (ret == 0) {
+
+                    drm.fbo = calloc(0, sizeof(struct drm_fb));
+                    drm.fbo->fb_id = fbId;
+					drm.fboMem = mem;
+
+                    return drm.fbo;    // SUCCESS!
+                }
+                else {
+                    int error = errno;
+                    fprintf(stderr, "cannot create framebuffer:%d %s", error, strerror(error));
+                    // unmap buffer
+                    munmap(mem, bo_create.size);
+                }   
+            }   
+            else {
+                int error = errno;
+                fprintf(stderr, "cannot mmap dumb buffer:%d %s", error, strerror(error));
+            }   
+        }   
+        else {
+            int error = errno;
+            fprintf(stderr, "cannot map dumb buffer:%d %s", error, strerror(error));
+        }
+    }
+    else {
+        int error = errno;
+        fprintf(stderr, "cannot create dumb buffer:%d %s", error, strerror(error));
+        return NULL;
+    }
+
+    // Clean up on error
+    struct drm_mode_destroy_dumb bo_destroy;
+    memset(&bo_destroy, 0, sizeof(bo_destroy));
+    bo_destroy.handle = bo_create.handle;
+    drmIoctl(drm.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &bo_destroy);
+    return NULL;
+}
+
+/*****************************
+ * SOFTWARE RENDER CALLBACKS *
+ *****************************/
+bool software_present(void* userData,
+				      const void* allocation,
+					  size_t row_bytes,
+					  size_t height)
+{
+	memcpy(drm.fboMem, allocation, row_bytes * height);
+/*
+	uint32_t pRow = drm.fb->pMem;
+	size_t rowPixels = rowBytes / sizeof(uint32t);
+
+	for(i = 0; i < height; i++) {
+	    memcpy(pRow, row_bytes, allocation);
+		pRow += rowPixels;
+		allocation
+	}
+*/
+	return true;
+}
+
+#endif // !OPENGL
+
+void on_platform_message(const FlutterPlatformMessage* message, void* userdata)
+{
+	int ok;
+	if ((ok = plugin_registry_on_platform_message((FlutterPlatformMessage *)message)) != 0)
+		fprintf(stderr, "plugin_registry_on_platform_message failed: %s\n", strerror(ok));
+}
+
+void vsync_callback(void* userdata, intptr_t baton)
+{
+	post_platform_task(&(struct flutterpi_task) {
+		.type = kVBlankRequest,
+		.target_time = 0,
+		.baton = baton
+	});
+}
 
 /************************
  * PLATFORM TASK-RUNNER *
@@ -979,6 +1127,7 @@ bool init_display(void) {
 	drm.connector_id = connector->connector_id;
 
 
+#ifdef USE_OPENGL
 
 	/**********************
 	 * GBM INITIALIZATION *
@@ -1061,13 +1210,11 @@ bool init_display(void) {
 	printf("  display extensions: \"%s\"\n", egl_exts_dpy);
 	printf("===================================\n");
 
-
 	printf("Binding OpenGL ES API...\n");
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
 		fprintf(stderr, "failed to bind OpenGL ES API\n");
 		return false;
 	}
-
 
 	printf("Choosing EGL config...\n");
 	EGLint count = 0, matched = 0;
@@ -1110,14 +1257,12 @@ bool init_display(void) {
 		return false;
 	}
 
-
 	printf("Creating EGL context...\n");
 	egl.context = eglCreateContext(egl.display, egl.config, EGL_NO_CONTEXT, context_attribs);
 	if (egl.context == NULL) {
 		fprintf(stderr, "failed to create EGL context\n");
 		return false;
 	}
-
 
 	printf("Creating EGL window surface...\n");
 	egl.surface = eglCreateWindowSurface(egl.display, egl.config, (EGLNativeWindowType) gbm.surface, NULL);
@@ -1175,6 +1320,12 @@ bool init_display(void) {
 		return false;
 	}
 
+#else // USE_OPENGL
+
+	struct drm_fb *fb = createDumbBuffer(width, height, 32);
+
+#endif
+
 	printf("Setting CRTC...\n");
 	ok = drmModeSetCrtc(drm.fd, drm.crtc_id, fb->fb_id, 0, 0, &drm.connector_id, 1, drm.mode);
 	if (ok) {
@@ -1182,21 +1333,45 @@ bool init_display(void) {
 		return false;
 	}
 
+#ifdef USE_OPENGL
 	printf("Clearing current context...\n");
 	if (!eglMakeCurrent(egl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
 		fprintf(stderr, "Could not clear EGL context\n");
 		return false;
 	}
+#endif
 
 	printf("finished display setup!\n");
 
 	return true;
 }
-void destroy_display(void) {
+
+/*
+void releaseDumbBuffer()
+{
+    // unmap buffer
+    munmap(pBuf->m_pMap, pBuf->m_size);
+
+    // delete DRM framebuffer
+    drmModeRmFB(pBuf->m_fd, pBuf->m_fbId);
+
+    // delete dumb buffer
+    struct drm_mode_destroy_dumb bo_destroy;
+    memset(&bo_destroy, 0, sizeof(bo_destroy));
+    bo_destroy.handle = pBuf->m_handle;
+    drmIoctl(pBuf->m_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &bo_destroy);
+    delete pBuf;
+}
+*/
+
+void destroy_display(void)
+{
 	fprintf(stderr, "Deinitializing display not yet implemented\n");
+	// releaseDumbBuffer(drm.fb);
 }
 
-bool init_application(void) {
+bool init_application(void)
+{
 	int ok, _errno;
 
 	printf("Initializing Plugin Registry...\n");
@@ -1206,6 +1381,7 @@ bool init_application(void) {
 		return false;
 	}
 
+#ifdef USE_OPENGL
 	// configure flutter rendering
 	flutter.renderer_config.type = kOpenGL;
 	flutter.renderer_config.open_gl.struct_size		= sizeof(flutter.renderer_config.open_gl);
@@ -1215,6 +1391,11 @@ bool init_application(void) {
 	flutter.renderer_config.open_gl.fbo_callback	= fbo_callback;
 	flutter.renderer_config.open_gl.gl_proc_resolver= proc_resolver;
 	flutter.renderer_config.open_gl.surface_transformation = transformation_callback;
+#else
+	flutter.renderer_config.type = kSoftware;
+	flutter.renderer_config.software.struct_size				= sizeof(flutter.renderer_config.software);
+	flutter.renderer_config.software.surface_present_callback	= software_present;
+#endif
 
 	// configure flutter
 	flutter.args.struct_size				= sizeof(FlutterProjectArgs);
@@ -1849,3 +2030,4 @@ int   main(int argc, char **argv) {
 	
 	return EXIT_SUCCESS;
 }
+
